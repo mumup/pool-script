@@ -27,7 +27,7 @@ Usage:
 Options:
   -a, --attempts N       Probe attempts per endpoint. Default: 5.
   -t, --timeout SEC      TCP connect timeout per attempt. Default: 3.
-  -p, --port PORT        Test only one port, for example 5566 or 5567. Default: all.
+  -p, --port PORT        Test only one configured port, for example 5566. Default: all.
   -r, --region TEXT      Filter by region or hostname text, for example Asia or sg1.
   -w, --watch SECONDS    Refresh human report every N seconds.
       --json             Output machine-readable JSON.

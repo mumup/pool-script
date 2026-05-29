@@ -3,12 +3,12 @@
 # Shared AlphaPool network helpers. Source this file from deployment scripts.
 
 ALPHAPOOL_ENDPOINTS=(
-  "US East|us1.alphapool.tech|5566 5567"
-  "US West|us2.alphapool.tech|5566 5567"
-  "Europe|eu1.alphapool.tech|5566 5567"
-  "Russia / Eurasia|ru1.alphapool.tech|5566 5567"
-  "Asia|sg1.alphapool.tech|5566 5567"
-  "Europe 2|eu2.alphapool.tech|5566 5567"
+  "US East|us1.alphapool.tech|5566"
+  "US West|us2.alphapool.tech|5566"
+  "Europe|eu1.alphapool.tech|5566"
+  "Russia / Eurasia|ru1.alphapool.tech|5566"
+  "Asia|sg1.alphapool.tech|5566"
+  "Europe 2|eu2.alphapool.tech|5566"
 )
 
 alphapool_trim() {
