@@ -39,12 +39,14 @@ for conf in /etc/ld.so.conf /etc/ld.so.conf.d/*.conf; do
   fi
 done
 
-if [ "$changed" -eq 1 ]; then
-  log "Running ldconfig"
-  ldconfig
-else
+if [ "$changed" -eq 0 ]; then
   log "No /etc/ld.so.conf CUDA compat entry found"
 fi
+
+# Always refresh. Some containers keep a stale /etc/ld.so.cache entry that
+# still points at CUDA compat even after the ldconfig config file is gone.
+log "Running ldconfig"
+ldconfig
 
 if printf '%s' "${LD_LIBRARY_PATH:-}" | grep -qE '/usr/local/cuda([^:]*)?/compat'; then
   log "Removing CUDA compat path from LD_LIBRARY_PATH for this process"
