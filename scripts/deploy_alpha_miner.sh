@@ -16,6 +16,7 @@ CURRENT_LINK="$INSTALL_ROOT/current"
 RUNNER_PATH="$INSTALL_ROOT/run-alpha-miner.sh"
 SUPERVISOR_PATH="$INSTALL_ROOT/supervise.sh"
 PID_FILE="$INSTALL_ROOT/alpha-miner-supervisor.pid"
+CUDA_FIX_SCRIPT="$SCRIPT_DIR/fix-cuda-forward-compat.sh"
 ENV_DIR="/etc/alphapool"
 ENV_FILE="$ENV_DIR/alpha-miner.env"
 LOG_FILE="/alpha-miner.log"
@@ -67,6 +68,9 @@ Deployment layout:
   /opt/alphapool/alpha-miner/current
   /etc/alphapool/alpha-miner.env
   /alpha-miner.log
+
+CUDA compatibility:
+  Runs scripts/fix-cuda-forward-compat.sh before starting the miner when present.
 EOF
 }
 
@@ -252,6 +256,16 @@ require_deploy_tools() {
   fi
 
   alphapool_require_network_tools || missing=1
+
+  if [[ -f "$CUDA_FIX_SCRIPT" ]]; then
+    for tool in ldconfig paste tr mv head; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'Missing required command for CUDA compatibility fix: %s\n' "$tool" >&2
+        missing=1
+      fi
+    done
+  fi
+
   return "$missing"
 }
 
@@ -814,6 +828,17 @@ stop_existing_miner() {
   log_ok "Old alpha-miner processes stopped"
 }
 
+run_cuda_forward_compat_fix() {
+  if [[ ! -f "$CUDA_FIX_SCRIPT" ]]; then
+    log_warn "CUDA forward compatibility fix script not found, skipping: $CUDA_FIX_SCRIPT"
+    return 0
+  fi
+
+  log_info "Running CUDA forward compatibility fix before starting alpha-miner"
+  as_root bash "$CUDA_FIX_SCRIPT"
+  log_ok "CUDA forward compatibility fix completed"
+}
+
 install_systemd_service() {
   local tmp_service
 
@@ -921,6 +946,7 @@ deploy() {
   if [[ "$NO_START" -eq 1 ]]; then
     log_ok "Installed and saved config. Miner was not started because --no-start was set."
   else
+    run_cuda_forward_compat_fix
     start_miner
   fi
 
