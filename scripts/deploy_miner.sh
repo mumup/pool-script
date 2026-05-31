@@ -6,38 +6,48 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/alphapool_network.sh
 source "$SCRIPT_DIR/lib/alphapool_network.sh"
 
-REPO_OWNER="AlphaMine-Tech"
-REPO_NAME="alpha-miner"
-GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+ALPHA_REPO_OWNER="AlphaMine-Tech"
+ALPHA_REPO_NAME="alpha-miner"
+ALPHA_GITHUB_API="https://api.github.com/repos/${ALPHA_REPO_OWNER}/${ALPHA_REPO_NAME}"
+PEARLHASH_URL_SCRIPT="$SCRIPT_DIR/lib/get-pearlhash-miner-url.sh"
 
-INSTALL_ROOT="/opt/alphapool/alpha-miner"
+INSTALL_ROOT="/opt/pearl-miner"
 VERSIONS_DIR="$INSTALL_ROOT/versions"
 CURRENT_LINK="$INSTALL_ROOT/current"
-RUNNER_PATH="$INSTALL_ROOT/run-alpha-miner.sh"
+RUNNER_PATH="$INSTALL_ROOT/run-miner.sh"
 SUPERVISOR_PATH="$INSTALL_ROOT/supervise.sh"
-PID_FILE="$INSTALL_ROOT/alpha-miner-supervisor.pid"
+PID_FILE="$INSTALL_ROOT/miner-supervisor.pid"
 CUDA_FIX_SCRIPT="$SCRIPT_DIR/fix-cuda-forward-compat.sh"
-ENV_DIR="/etc/alphapool"
-ENV_FILE="$ENV_DIR/alpha-miner.env"
-LOG_FILE="/alpha-miner.log"
-SERVICE_NAME="alpha-miner.service"
+ENV_DIR="/etc/pearl-miner"
+ENV_FILE="$ENV_DIR/miner.env"
+OLD_ENV_FILE="/etc/alphapool/alpha-miner.env"
+LOG_FILE="/pearl-miner.log"
+SERVICE_NAME="pearl-miner.service"
+OLD_SERVICE_NAME="alpha-miner.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 
 ACTION="deploy"
 YES=0
 NO_START=0
 
+CLI_PROVIDER=""
 CLI_VERSION=""
 CLI_ADDRESS=""
 CLI_WORKER=""
 CLI_POOL=""
 
-INHERITED_VERSION="${ALPHAPOOL_VERSION:-}"
-INHERITED_BIN="${ALPHAPOOL_BIN:-}"
-INHERITED_POOL="${ALPHAPOOL_POOL:-}"
-INHERITED_ADDRESS="${ALPHAPOOL_ADDRESS:-}"
-INHERITED_WORKER="${ALPHAPOOL_WORKER:-}"
-INHERITED_LOG="${ALPHAPOOL_LOG:-}"
+INHERITED_PROVIDER="${PEARL_MINER_PROVIDER:-}"
+INHERITED_VERSION="${PEARL_MINER_VERSION:-}"
+INHERITED_BIN="${PEARL_MINER_BIN:-}"
+INHERITED_POOL="${PEARL_MINER_POOL:-}"
+INHERITED_ADDRESS="${PEARL_MINER_ADDRESS:-}"
+INHERITED_WORKER="${PEARL_MINER_WORKER:-}"
+INHERITED_LOG="${PEARL_MINER_LOG:-}"
+
+PEARLHASH_ENDPOINTS=(
+  "EU/US|84.32.220.219|9000"
+  "Asia|129.226.55.135|9000"
+)
 
 VERSION_ROWS=()
 VERSION_TAGS=()
@@ -45,29 +55,33 @@ VERSION_PRERELEASES=()
 VERSION_PUBLISHED=()
 VERSION_NAMES=()
 
+PEARL_MINER_DOWNLOAD_URL=""
+PEARL_MINER_DOWNLOAD_SHA256=""
+
 usage() {
   cat <<'EOF'
-Alpha Miner one-click deploy script
+PRL miner one-click deploy script
 
 Usage:
-  ./deploy_alpha_miner.sh [options]
+  ./deploy_miner.sh [options]
 
 Options:
-      --version TAG       Use a specific Alpha Miner release tag.
+      --provider NAME     Mining provider: alphapool or pearlhash.
+      --version TAG       Use a specific AlphaPool release tag. For PearlHash, assert latest URL version.
       --address ADDRESS   Pearl/PRL address, for example prl1p...
       --worker NAME       Worker name, for example rig01.
       --pool HOST:PORT    Mining pool endpoint. Skips automatic pool selection.
       --yes               Non-interactive mode. Missing PRL address fails.
       --no-start          Install and save config, but do not start miner.
       --status            Show service/supervisor status and recent logs.
-      --stop              Stop alpha-miner service and matching processes.
+      --stop              Stop miner services and matching processes.
   -h, --help              Show this help.
 
 Deployment layout:
-  /opt/alphapool/alpha-miner/versions/<tag>/alpha-miner
-  /opt/alphapool/alpha-miner/current
-  /etc/alphapool/alpha-miner.env
-  /alpha-miner.log
+  /opt/pearl-miner/versions/<provider>-<version>/
+  /opt/pearl-miner/current
+  /etc/pearl-miner/miner.env
+  /pearl-miner.log
 
 CUDA compatibility:
   Runs scripts/fix-cuda-forward-compat.sh before starting the miner when present.
@@ -76,6 +90,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --provider)
+      [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 2; }
+      CLI_PROVIDER="$2"
+      shift 2
+      ;;
     --version)
       [[ $# -ge 2 ]] || { echo "Missing value for $1" >&2; exit 2; }
       CLI_VERSION="$2"
@@ -255,6 +274,11 @@ require_deploy_tools() {
     missing=1
   fi
 
+  if [[ -f "$PEARLHASH_URL_SCRIPT" ]] && ! command -v curl >/dev/null 2>&1; then
+    printf 'Missing required command for PearlHash URL helper: curl\n' >&2
+    missing=1
+  fi
+
   alphapool_require_network_tools || missing=1
 
   if [[ -f "$CUDA_FIX_SCRIPT" ]]; then
@@ -271,33 +295,54 @@ require_deploy_tools() {
 
 load_persisted_env() {
   local key value
+  local loaded_new=0
 
   if [[ -r "$ENV_FILE" ]]; then
+    loaded_new=1
     while IFS='=' read -r key value; do
       [[ -n "$key" && "$key" != \#* ]] || continue
       case "$key" in
-        ALPHAPOOL_VERSION) ALPHAPOOL_VERSION="$value" ;;
-        ALPHAPOOL_BIN) ALPHAPOOL_BIN="$value" ;;
-        ALPHAPOOL_POOL) ALPHAPOOL_POOL="$value" ;;
-        ALPHAPOOL_ADDRESS) ALPHAPOOL_ADDRESS="$value" ;;
-        ALPHAPOOL_WORKER) ALPHAPOOL_WORKER="$value" ;;
-        ALPHAPOOL_LOG) ALPHAPOOL_LOG="$value" ;;
+        PEARL_MINER_PROVIDER) PEARL_MINER_PROVIDER="$value" ;;
+        PEARL_MINER_VERSION) PEARL_MINER_VERSION="$value" ;;
+        PEARL_MINER_BIN) PEARL_MINER_BIN="$value" ;;
+        PEARL_MINER_POOL) PEARL_MINER_POOL="$value" ;;
+        PEARL_MINER_ADDRESS) PEARL_MINER_ADDRESS="$value" ;;
+        PEARL_MINER_WORKER) PEARL_MINER_WORKER="$value" ;;
+        PEARL_MINER_LOG) PEARL_MINER_LOG="$value" ;;
       esac
     done < "$ENV_FILE"
   fi
 
-  [[ -n "$INHERITED_VERSION" ]] && ALPHAPOOL_VERSION="$INHERITED_VERSION"
-  [[ -n "$INHERITED_BIN" ]] && ALPHAPOOL_BIN="$INHERITED_BIN"
-  [[ -n "$INHERITED_POOL" ]] && ALPHAPOOL_POOL="$INHERITED_POOL"
-  [[ -n "$INHERITED_ADDRESS" ]] && ALPHAPOOL_ADDRESS="$INHERITED_ADDRESS"
-  [[ -n "$INHERITED_WORKER" ]] && ALPHAPOOL_WORKER="$INHERITED_WORKER"
-  [[ -n "$INHERITED_LOG" ]] && ALPHAPOOL_LOG="$INHERITED_LOG"
+  if [[ "$loaded_new" -eq 0 && -r "$OLD_ENV_FILE" ]]; then
+    while IFS='=' read -r key value; do
+      [[ -n "$key" && "$key" != \#* ]] || continue
+      case "$key" in
+        ALPHAPOOL_VERSION) PEARL_MINER_VERSION="${PEARL_MINER_VERSION:-$value}" ;;
+        ALPHAPOOL_POOL) PEARL_MINER_POOL="${PEARL_MINER_POOL:-$value}" ;;
+        ALPHAPOOL_ADDRESS) PEARL_MINER_ADDRESS="${PEARL_MINER_ADDRESS:-$value}" ;;
+        ALPHAPOOL_WORKER) PEARL_MINER_WORKER="${PEARL_MINER_WORKER:-$value}" ;;
+      esac
+    done < "$OLD_ENV_FILE"
+    PEARL_MINER_PROVIDER="${PEARL_MINER_PROVIDER:-alphapool}"
+  fi
 
-  [[ -n "$CLI_VERSION" ]] && ALPHAPOOL_VERSION="$CLI_VERSION"
-  [[ -n "$CLI_POOL" ]] && ALPHAPOOL_POOL="$CLI_POOL"
-  [[ -n "$CLI_ADDRESS" ]] && ALPHAPOOL_ADDRESS="$CLI_ADDRESS"
-  [[ -n "$CLI_WORKER" ]] && ALPHAPOOL_WORKER="$CLI_WORKER"
-  ALPHAPOOL_LOG="${ALPHAPOOL_LOG:-$LOG_FILE}"
+  [[ -n "$INHERITED_PROVIDER" ]] && PEARL_MINER_PROVIDER="$INHERITED_PROVIDER"
+  [[ -n "$INHERITED_VERSION" ]] && PEARL_MINER_VERSION="$INHERITED_VERSION"
+  [[ -n "$INHERITED_BIN" ]] && PEARL_MINER_BIN="$INHERITED_BIN"
+  [[ -n "$INHERITED_POOL" ]] && PEARL_MINER_POOL="$INHERITED_POOL"
+  [[ -n "$INHERITED_ADDRESS" ]] && PEARL_MINER_ADDRESS="$INHERITED_ADDRESS"
+  [[ -n "$INHERITED_WORKER" ]] && PEARL_MINER_WORKER="$INHERITED_WORKER"
+  [[ -n "$INHERITED_LOG" ]] && PEARL_MINER_LOG="$INHERITED_LOG"
+
+  [[ -n "$CLI_VERSION" ]] && PEARL_MINER_VERSION="$CLI_VERSION"
+  [[ -n "$CLI_POOL" ]] && PEARL_MINER_POOL="$CLI_POOL"
+  [[ -n "$CLI_ADDRESS" ]] && PEARL_MINER_ADDRESS="$CLI_ADDRESS"
+  [[ -n "$CLI_WORKER" ]] && PEARL_MINER_WORKER="$CLI_WORKER"
+  PEARL_MINER_LOG="${PEARL_MINER_LOG:-$LOG_FILE}"
+}
+
+valid_provider() {
+  [[ "$1" == "alphapool" || "$1" == "pearlhash" ]]
 }
 
 valid_tag() {
@@ -357,6 +402,50 @@ prompt_value() {
   printf '%s' "$value"
 }
 
+select_provider() {
+  local selected choice default_provider previous_provider
+
+  previous_provider="${PEARL_MINER_PROVIDER:-}"
+  if [[ -n "$CLI_PROVIDER" ]]; then
+    valid_provider "$CLI_PROVIDER" || die "Invalid provider: $CLI_PROVIDER"
+    PEARL_MINER_PROVIDER="$CLI_PROVIDER"
+    if [[ -n "$previous_provider" && "$previous_provider" != "$PEARL_MINER_PROVIDER" ]]; then
+      PEARL_MINER_VERSION=""
+      PEARL_MINER_BIN=""
+      [[ -z "$CLI_POOL" ]] && PEARL_MINER_POOL=""
+    fi
+    return 0
+  fi
+
+  default_provider="${PEARL_MINER_PROVIDER:-alphapool}"
+  valid_provider "$default_provider" || die "Invalid saved provider: $default_provider"
+
+  if [[ "$YES" -eq 1 || ! -t 0 ]]; then
+    PEARL_MINER_PROVIDER="$default_provider"
+    return 0
+  fi
+
+  printf '\nAvailable mining providers:\n' >&2
+  printf '  1) alphapool   AlphaPool stratum pool\n' >&2
+  printf '  2) pearlhash   PearlHash pool\n' >&2
+  printf 'Select provider [%s]: ' "$default_provider" >&2
+  IFS= read -r choice
+
+  case "$choice" in
+    "") selected="$default_provider" ;;
+    1|alphapool|AlphaPool|ALPHAPOOL) selected="alphapool" ;;
+    2|pearlhash|PearlHash|PEARLHASH) selected="pearlhash" ;;
+    *) die "Invalid provider selection: $choice" ;;
+  esac
+
+  PEARL_MINER_PROVIDER="$selected"
+  if [[ -n "$previous_provider" && "$previous_provider" != "$PEARL_MINER_PROVIDER" ]]; then
+    PEARL_MINER_VERSION=""
+    PEARL_MINER_BIN=""
+    [[ -z "$CLI_POOL" ]] && PEARL_MINER_POOL=""
+  fi
+}
+
 parse_releases_json() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c '
@@ -407,7 +496,7 @@ load_versions() {
   local tmp line tag pre published name
 
   tmp="$(mktemp)"
-  if http_get_to_file "${GITHUB_API}/releases?per_page=50" "$tmp"; then
+  if http_get_to_file "${ALPHA_GITHUB_API}/releases?per_page=50" "$tmp"; then
     while IFS=$'\t' read -r tag pre published name; do
       [[ -n "$tag" ]] || continue
       VERSION_ROWS+=("$tag"$'\t'"$pre"$'\t'"$published"$'\t'"$name")
@@ -421,7 +510,7 @@ load_versions() {
   if [[ "${#VERSION_ROWS[@]}" -eq 0 ]]; then
     log_warn "Could not parse releases API; falling back to tags API."
     : > "$tmp"
-    http_get_to_file "${GITHUB_API}/tags?per_page=50" "$tmp" || {
+    http_get_to_file "${ALPHA_GITHUB_API}/tags?per_page=50" "$tmp" || {
       rm -f "$tmp"
       die "Could not fetch Alpha Miner tags from GitHub."
     }
@@ -464,21 +553,26 @@ latest_stable_version() {
 select_version() {
   local default_version selected choice i label
 
+  if [[ "$PEARL_MINER_PROVIDER" == "pearlhash" ]]; then
+    select_pearlhash_version
+    return 0
+  fi
+
   load_versions
 
-  default_version="${ALPHAPOOL_VERSION:-}"
+  default_version="${PEARL_MINER_VERSION:-}"
   if [[ -z "$default_version" ]] || ! tag_in_version_list "$default_version"; then
     default_version="$(latest_stable_version)"
   fi
 
   if [[ -n "$CLI_VERSION" ]]; then
     valid_tag "$CLI_VERSION" || die "Invalid version tag: $CLI_VERSION"
-    ALPHAPOOL_VERSION="$CLI_VERSION"
+    PEARL_MINER_VERSION="$CLI_VERSION"
     return 0
   fi
 
   if [[ "$YES" -eq 1 || ! -t 0 ]]; then
-    ALPHAPOOL_VERSION="$default_version"
+    PEARL_MINER_VERSION="$default_version"
     return 0
   fi
 
@@ -504,7 +598,32 @@ select_version() {
   fi
 
   valid_tag "$selected" || die "Invalid version tag: $selected"
-  ALPHAPOOL_VERSION="$selected"
+  PEARL_MINER_VERSION="$selected"
+}
+
+parse_pearlhash_version_from_url() {
+  local url="$1"
+  local version
+
+  version="$(printf '%s' "$url" | sed -n 's/^.*pearl-miner-v\([0-9][0-9]*\).*$/v\1/p')"
+  [[ -n "$version" ]] || return 1
+  printf '%s' "$version"
+}
+
+select_pearlhash_version() {
+  local url version
+
+  [[ -x "$PEARLHASH_URL_SCRIPT" || -f "$PEARLHASH_URL_SCRIPT" ]] || die "PearlHash URL helper not found: $PEARLHASH_URL_SCRIPT"
+  url="$(bash "$PEARLHASH_URL_SCRIPT" check)" || die "Could not get PearlHash miner download URL."
+  version="$(parse_pearlhash_version_from_url "$url")" || die "Could not parse PearlHash miner version from URL: $url"
+
+  if [[ -n "$CLI_VERSION" && "$CLI_VERSION" != "$version" ]]; then
+    die "PearlHash only exposes latest $version, but --version requested $CLI_VERSION."
+  fi
+
+  PEARL_MINER_DOWNLOAD_URL="$url"
+  PEARL_MINER_VERSION="$version"
+  log_ok "PearlHash miner latest version: $version"
 }
 
 parse_asset_info_json() {
@@ -544,7 +663,7 @@ get_release_asset_info() {
   local tmp info url digest
 
   tmp="$(mktemp)"
-  http_get_to_file "${GITHUB_API}/releases/tags/${tag}" "$tmp" || {
+  http_get_to_file "${ALPHA_GITHUB_API}/releases/tags/${tag}" "$tmp" || {
     rm -f "$tmp"
     die "Could not fetch GitHub release for tag $tag. The tag may not have release assets."
   }
@@ -555,30 +674,39 @@ get_release_asset_info() {
   IFS=$'\t' read -r url digest <<< "$info"
   [[ -n "$url" ]] || die "Release $tag does not contain a Linux asset named exactly 'alpha-miner'."
 
-  ALPHAPOOL_ASSET_URL="$url"
-  ALPHAPOOL_ASSET_SHA256="$digest"
+  PEARL_MINER_DOWNLOAD_URL="$url"
+  PEARL_MINER_DOWNLOAD_SHA256="$digest"
 }
 
 download_and_install_miner() {
   local tag="$1"
-  local version_dir="$VERSIONS_DIR/$tag"
+  local version_dir="$VERSIONS_DIR/${PEARL_MINER_PROVIDER}-${tag}"
   local tmp_bin actual_sha expected_sha
+  local installed_name
 
-  get_release_asset_info "$tag"
-  log_info "Downloading alpha-miner $tag"
+  if [[ "$PEARL_MINER_PROVIDER" == "alphapool" ]]; then
+    get_release_asset_info "$tag"
+    installed_name="alpha-miner"
+    log_info "Downloading AlphaPool alpha-miner $tag"
+  else
+    [[ -n "$PEARL_MINER_DOWNLOAD_URL" ]] || select_pearlhash_version
+    PEARL_MINER_DOWNLOAD_SHA256=""
+    installed_name="pearl-miner"
+    log_info "Downloading PearlHash pearl-miner $tag"
+  fi
 
   tmp_bin="$(mktemp)"
-  http_get_to_file "$ALPHAPOOL_ASSET_URL" "$tmp_bin" || {
+  http_get_to_file "$PEARL_MINER_DOWNLOAD_URL" "$tmp_bin" || {
     rm -f "$tmp_bin"
-    die "Download failed: $ALPHAPOOL_ASSET_URL"
+    die "Download failed: $PEARL_MINER_DOWNLOAD_URL"
   }
 
-  if [[ -n "${ALPHAPOOL_ASSET_SHA256:-}" ]]; then
+  if [[ -n "${PEARL_MINER_DOWNLOAD_SHA256:-}" ]]; then
     command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || {
       rm -f "$tmp_bin"
       die "Release provides SHA256 digest but neither sha256sum nor shasum is installed."
     }
-    expected_sha="$(printf '%s' "$ALPHAPOOL_ASSET_SHA256" | tr '[:upper:]' '[:lower:]')"
+    expected_sha="$(printf '%s' "$PEARL_MINER_DOWNLOAD_SHA256" | tr '[:upper:]' '[:lower:]')"
     actual_sha="$(sha256_file "$tmp_bin" | tr '[:upper:]' '[:lower:]')"
     if [[ "$actual_sha" != "$expected_sha" ]]; then
       rm -f "$tmp_bin"
@@ -586,15 +714,15 @@ download_and_install_miner() {
     fi
     log_ok "SHA256 verified"
   else
-    log_warn "No SHA256 digest was provided by the GitHub release; continuing without checksum verification."
+    log_warn "No SHA256 digest is available for this miner download; continuing after URL validation."
   fi
 
   as_root mkdir -p "$version_dir"
-  as_root install -m 0755 "$tmp_bin" "$version_dir/alpha-miner"
+  as_root install -m 0755 "$tmp_bin" "$version_dir/$installed_name"
   as_root ln -sfnT "$version_dir" "$CURRENT_LINK"
   rm -f "$tmp_bin"
 
-  ALPHAPOOL_BIN="$CURRENT_LINK/alpha-miner"
+  PEARL_MINER_BIN="$CURRENT_LINK/$installed_name"
 }
 
 write_runtime_scripts() {
@@ -614,17 +742,32 @@ fi
 # shellcheck source=/dev/null
 source "\$ENV_FILE"
 
-: "\${ALPHAPOOL_BIN:?missing ALPHAPOOL_BIN}"
-: "\${ALPHAPOOL_POOL:?missing ALPHAPOOL_POOL}"
-: "\${ALPHAPOOL_ADDRESS:?missing ALPHAPOOL_ADDRESS}"
-: "\${ALPHAPOOL_WORKER:?missing ALPHAPOOL_WORKER}"
-: "\${ALPHAPOOL_LOG:?missing ALPHAPOOL_LOG}"
+: "\${PEARL_MINER_PROVIDER:?missing PEARL_MINER_PROVIDER}"
+: "\${PEARL_MINER_BIN:?missing PEARL_MINER_BIN}"
+: "\${PEARL_MINER_POOL:?missing PEARL_MINER_POOL}"
+: "\${PEARL_MINER_ADDRESS:?missing PEARL_MINER_ADDRESS}"
+: "\${PEARL_MINER_WORKER:?missing PEARL_MINER_WORKER}"
+: "\${PEARL_MINER_LOG:?missing PEARL_MINER_LOG}"
 
-cd "\$(dirname "\$ALPHAPOOL_BIN")"
-exec "\$ALPHAPOOL_BIN" \\
-  --pool "stratum+tcp://\${ALPHAPOOL_POOL}" \\
-  --address "\$ALPHAPOOL_ADDRESS" \\
-  --worker "\$ALPHAPOOL_WORKER" >> "\$ALPHAPOOL_LOG" 2>&1
+cd "\$(dirname "\$PEARL_MINER_BIN")"
+case "\$PEARL_MINER_PROVIDER" in
+  alphapool)
+    exec "\$PEARL_MINER_BIN" \\
+      --pool "stratum+tcp://\${PEARL_MINER_POOL}" \\
+      --address "\$PEARL_MINER_ADDRESS" \\
+      --worker "\$PEARL_MINER_WORKER" >> "\$PEARL_MINER_LOG" 2>&1
+    ;;
+  pearlhash)
+    exec "\$PEARL_MINER_BIN" \\
+      --host "\$PEARL_MINER_POOL" \\
+      --user "\$PEARL_MINER_ADDRESS" \\
+      --worker "\$PEARL_MINER_WORKER" >> "\$PEARL_MINER_LOG" 2>&1
+    ;;
+  *)
+    echo "Unsupported provider: \$PEARL_MINER_PROVIDER" >&2
+    exit 2
+    ;;
+esac
 EOF
 
   tmp_supervisor="$(mktemp)"
@@ -641,13 +784,13 @@ while true; do
   if [[ -r "\$ENV_FILE" ]]; then
     # shellcheck source=/dev/null
     source "\$ENV_FILE"
-    log_file="\${ALPHAPOOL_LOG:-\$DEFAULT_LOG}"
+    log_file="\${PEARL_MINER_LOG:-\$DEFAULT_LOG}"
   fi
 
-  printf '[%s] supervisor starting alpha-miner\\n' "\$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "\$log_file"
+  printf '[%s] supervisor starting miner\\n' "\$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "\$log_file"
   "\$RUNNER"
   rc=\$?
-  printf '[%s] alpha-miner exited rc=%s; restarting in 10s\\n' "\$(date '+%Y-%m-%d %H:%M:%S %Z')" "\$rc" >> "\$log_file"
+  printf '[%s] miner exited rc=%s; restarting in 10s\\n' "\$(date '+%Y-%m-%d %H:%M:%S %Z')" "\$rc" >> "\$log_file"
   sleep 10
 done
 EOF
@@ -661,27 +804,29 @@ EOF
 write_env_file() {
   local tmp_env
 
-  valid_tag "$ALPHAPOOL_VERSION" || die "Invalid ALPHAPOOL_VERSION: $ALPHAPOOL_VERSION"
-  valid_pool "$ALPHAPOOL_POOL" || die "Invalid ALPHAPOOL_POOL: $ALPHAPOOL_POOL"
-  valid_prl_address "$ALPHAPOOL_ADDRESS" || die "Invalid ALPHAPOOL_ADDRESS. It must be non-empty, contain no spaces, and start with prl."
-  valid_worker "$ALPHAPOOL_WORKER" || die "Invalid ALPHAPOOL_WORKER. It must be non-empty and contain no spaces."
-  valid_abs_path "$ALPHAPOOL_BIN" || die "Invalid ALPHAPOOL_BIN path: $ALPHAPOOL_BIN"
-  valid_abs_path "$ALPHAPOOL_LOG" || die "Invalid ALPHAPOOL_LOG path: $ALPHAPOOL_LOG"
+  valid_provider "$PEARL_MINER_PROVIDER" || die "Invalid PEARL_MINER_PROVIDER: $PEARL_MINER_PROVIDER"
+  valid_tag "$PEARL_MINER_VERSION" || die "Invalid PEARL_MINER_VERSION: $PEARL_MINER_VERSION"
+  valid_pool "$PEARL_MINER_POOL" || die "Invalid PEARL_MINER_POOL: $PEARL_MINER_POOL"
+  valid_prl_address "$PEARL_MINER_ADDRESS" || die "Invalid PEARL_MINER_ADDRESS. It must be non-empty, contain no spaces, and start with prl."
+  valid_worker "$PEARL_MINER_WORKER" || die "Invalid PEARL_MINER_WORKER. It must be non-empty and contain no spaces."
+  valid_abs_path "$PEARL_MINER_BIN" || die "Invalid PEARL_MINER_BIN path: $PEARL_MINER_BIN"
+  valid_abs_path "$PEARL_MINER_LOG" || die "Invalid PEARL_MINER_LOG path: $PEARL_MINER_LOG"
 
   tmp_env="$(mktemp)"
   cat > "$tmp_env" <<EOF
-ALPHAPOOL_VERSION=$ALPHAPOOL_VERSION
-ALPHAPOOL_BIN=$ALPHAPOOL_BIN
-ALPHAPOOL_POOL=$ALPHAPOOL_POOL
-ALPHAPOOL_ADDRESS=$ALPHAPOOL_ADDRESS
-ALPHAPOOL_WORKER=$ALPHAPOOL_WORKER
-ALPHAPOOL_LOG=$ALPHAPOOL_LOG
+PEARL_MINER_PROVIDER=$PEARL_MINER_PROVIDER
+PEARL_MINER_VERSION=$PEARL_MINER_VERSION
+PEARL_MINER_BIN=$PEARL_MINER_BIN
+PEARL_MINER_POOL=$PEARL_MINER_POOL
+PEARL_MINER_ADDRESS=$PEARL_MINER_ADDRESS
+PEARL_MINER_WORKER=$PEARL_MINER_WORKER
+PEARL_MINER_LOG=$PEARL_MINER_LOG
 EOF
 
   as_root mkdir -p "$ENV_DIR"
   as_root install -m 0644 "$tmp_env" "$ENV_FILE"
-  as_root touch "$ALPHAPOOL_LOG"
-  as_root chmod 0644 "$ALPHAPOOL_LOG"
+  as_root touch "$PEARL_MINER_LOG"
+  as_root chmod 0644 "$PEARL_MINER_LOG"
   rm -f "$tmp_env"
 }
 
@@ -699,23 +844,58 @@ print_pool_table() {
   done
 }
 
+list_provider_pool_ports() {
+  local item region host ports port
+
+  case "$PEARL_MINER_PROVIDER" in
+    alphapool)
+      alphapool_list_pool_ports
+      ;;
+    pearlhash)
+      pool_list_ports_from_entries "${PEARLHASH_ENDPOINTS[@]}"
+      ;;
+    *)
+      die "Unsupported provider: $PEARL_MINER_PROVIDER"
+      ;;
+  esac
+}
+
+provider_display_name() {
+  case "$PEARL_MINER_PROVIDER" in
+    alphapool) printf 'AlphaPool' ;;
+    pearlhash) printf 'PearlHash' ;;
+    *) printf '%s' "$PEARL_MINER_PROVIDER" ;;
+  esac
+}
+
+provider_fallback_pool() {
+  case "$PEARL_MINER_PROVIDER" in
+    alphapool) printf 'us2.alphapool.tech:5566' ;;
+    pearlhash) printf '129.226.55.135:9000' ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_best_pool() {
   local rows=()
   local region host port line best
   local best_region best_host best_port best_attempts best_success best_success_rate best_loss best_min best_avg best_max best_jitter best_status best_score
+  local provider_name fallback_pool
 
-  log_info "Testing AlphaPool endpoints on configured mining ports"
+  provider_name="$(provider_display_name)"
+  log_info "Testing $provider_name endpoints on configured mining ports"
   while IFS=$'\t' read -r region host port; do
-    line="$(alphapool_test_endpoint_tsv "$region" "$host" "$port" 5 3)"
+    line="$(pool_test_endpoint_tsv "$region" "$host" "$port" 5 3)"
     rows+=("$line")
-  done < <(alphapool_list_pool_ports)
+  done < <(list_provider_pool_ports)
 
   print_pool_table rows >&2
-  best="$(printf '%s\n' "${rows[@]}" | alphapool_best_result_from_tsv || true)"
+  best="$(printf '%s\n' "${rows[@]}" | pool_best_result_from_tsv || true)"
 
   if [[ -z "$best" ]]; then
-    log_warn "No reachable AlphaPool endpoint was found; using fallback us2.alphapool.tech:5566."
-    printf '%s' "us2.alphapool.tech:5566"
+    fallback_pool="$(provider_fallback_pool)"
+    log_warn "No reachable $provider_name endpoint was found; using fallback $fallback_pool."
+    printf '%s' "$fallback_pool"
     return 0
   fi
 
@@ -729,54 +909,57 @@ select_pool() {
 
   if [[ -n "$CLI_POOL" ]]; then
     valid_pool "$CLI_POOL" || die "Invalid pool: $CLI_POOL"
-    ALPHAPOOL_POOL="$CLI_POOL"
+    PEARL_MINER_POOL="$CLI_POOL"
     return 0
   fi
 
   detected_pool="$(detect_best_pool)"
-  default_pool="${ALPHAPOOL_POOL:-$detected_pool}"
+  default_pool="${PEARL_MINER_POOL:-$detected_pool}"
 
-  if [[ -n "${ALPHAPOOL_POOL:-}" && "$ALPHAPOOL_POOL" != "$detected_pool" ]]; then
-    log_info "Saved pool: $ALPHAPOOL_POOL; fastest now: $detected_pool"
+  if [[ -n "${PEARL_MINER_POOL:-}" && "$PEARL_MINER_POOL" != "$detected_pool" ]]; then
+    log_info "Saved pool: $PEARL_MINER_POOL; fastest now: $detected_pool"
   fi
 
   selected_pool="$(prompt_value "Pool endpoint" "$default_pool")"
   valid_pool "$selected_pool" || die "Invalid pool endpoint: $selected_pool"
-  ALPHAPOOL_POOL="$selected_pool"
+  PEARL_MINER_POOL="$selected_pool"
 }
 
 select_address() {
   local selected
 
-  selected="$(prompt_value "Pearl/PRL address" "${ALPHAPOOL_ADDRESS:-}")"
+  selected="$(prompt_value "Pearl/PRL address" "${PEARL_MINER_ADDRESS:-}")"
   valid_prl_address "$selected" || die "Invalid Pearl/PRL address. It must start with prl and contain no spaces."
-  ALPHAPOOL_ADDRESS="$selected"
+  PEARL_MINER_ADDRESS="$selected"
 }
 
 select_worker() {
   local default_worker selected
 
-  default_worker="${ALPHAPOOL_WORKER:-$(sanitize_worker_default)}"
+  default_worker="${PEARL_MINER_WORKER:-$(sanitize_worker_default)}"
   selected="$(prompt_value "Worker name" "$default_worker")"
   valid_worker "$selected" || die "Invalid worker name. It must be non-empty and contain no spaces."
-  ALPHAPOOL_WORKER="$selected"
+  PEARL_MINER_WORKER="$selected"
 }
 
-find_alpha_pids() {
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -af 'alpha-miner' 2>/dev/null || true
-  else
-    ps -eo pid=,args= 2>/dev/null | grep '[a]lpha-miner' || true
-  fi | awk -v self="$$" '
+find_miner_pids() {
+  ps -eo pid=,comm=,args= 2>/dev/null | awk -v self="$$" -v supervisor="$SUPERVISOR_PATH" '
     {
       pid=$1
+      comm=$2
       $1=""
+      $2=""
       cmd=$0
       if (pid != self &&
-          cmd ~ /alpha-miner/ &&
-          cmd !~ /deploy_alpha_miner.sh/ &&
+          (comm ~ /^alpha-miner/ ||
+           comm == "pearl-miner" ||
+           cmd ~ /(^|[ /])alpha-miner[^ /]*( |$)/ ||
+           cmd ~ /(^|[ /])pearl-miner( |$)/ ||
+           index(cmd, supervisor) > 0) &&
+          cmd !~ /deploy_miner.sh/ &&
           cmd !~ /check_pool_latency.sh/ &&
-          cmd !~ /pgrep -af/) {
+          cmd !~ /get-pearlhash-miner-url.sh/ &&
+          cmd !~ /awk -v self=/) {
         print pid
       }
     }
@@ -791,6 +974,7 @@ pid_alive() {
 stop_systemd_service() {
   if command -v systemctl >/dev/null 2>&1; then
     as_root systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    as_root systemctl stop "$OLD_SERVICE_NAME" >/dev/null 2>&1 || true
   fi
 }
 
@@ -799,16 +983,16 @@ stop_existing_miner() {
   local alive=()
   local pid i
 
-  log_info "Stopping existing alpha-miner service/processes if present"
+  log_info "Stopping existing miner services/processes if present"
   stop_systemd_service
 
-  mapfile -t pids < <(find_alpha_pids)
+  mapfile -t pids < <(find_miner_pids)
   if [[ "${#pids[@]}" -eq 0 ]]; then
-    log_ok "No running alpha-miner process found"
+    log_ok "No running miner process found"
     return 0
   fi
 
-  log_info "Sending TERM to alpha-miner PIDs: ${pids[*]}"
+  log_info "Sending TERM to miner PIDs: ${pids[*]}"
   as_root kill -TERM "${pids[@]}" >/dev/null 2>&1 || true
 
   for ((i = 0; i < 10; i++)); do
@@ -821,11 +1005,11 @@ stop_existing_miner() {
   done
 
   if [[ "${#alive[@]}" -gt 0 ]]; then
-    log_warn "Forcing alpha-miner PIDs: ${alive[*]}"
+    log_warn "Forcing miner PIDs: ${alive[*]}"
     as_root kill -KILL "${alive[@]}" >/dev/null 2>&1 || true
   fi
 
-  log_ok "Old alpha-miner processes stopped"
+  log_ok "Old miner processes stopped"
 }
 
 run_cuda_forward_compat_fix() {
@@ -834,7 +1018,7 @@ run_cuda_forward_compat_fix() {
     return 0
   fi
 
-  log_info "Running CUDA forward compatibility fix before starting alpha-miner"
+  log_info "Running CUDA forward compatibility fix before starting miner"
   as_root bash "$CUDA_FIX_SCRIPT"
   log_ok "CUDA forward compatibility fix completed"
 }
@@ -845,7 +1029,7 @@ install_systemd_service() {
   tmp_service="$(mktemp)"
   cat > "$tmp_service" <<EOF
 [Unit]
-Description=Alpha Miner
+Description=PRL Miner
 After=network-online.target
 Wants=network-online.target
 
@@ -895,13 +1079,14 @@ show_status() {
 
   load_persisted_env
 
-  printf 'Alpha Miner deploy script v%s\n' "$VERSION"
+  printf 'PRL miner deploy script v%s\n' "$VERSION"
   printf 'Config: %s\n' "$ENV_FILE"
-  printf 'Version: %s\n' "${ALPHAPOOL_VERSION:-N/A}"
-  printf 'Binary: %s\n' "${ALPHAPOOL_BIN:-N/A}"
-  printf 'Pool: %s\n' "${ALPHAPOOL_POOL:-N/A}"
-  printf 'Worker: %s\n' "${ALPHAPOOL_WORKER:-N/A}"
-  printf 'Log: %s\n' "${ALPHAPOOL_LOG:-$LOG_FILE}"
+  printf 'Provider: %s\n' "${PEARL_MINER_PROVIDER:-N/A}"
+  printf 'Version: %s\n' "${PEARL_MINER_VERSION:-N/A}"
+  printf 'Binary: %s\n' "${PEARL_MINER_BIN:-N/A}"
+  printf 'Pool: %s\n' "${PEARL_MINER_POOL:-N/A}"
+  printf 'Worker: %s\n' "${PEARL_MINER_WORKER:-N/A}"
+  printf 'Log: %s\n' "${PEARL_MINER_LOG:-$LOG_FILE}"
   printf '\n'
 
   if command -v systemctl >/dev/null 2>&1 && [[ -f "$SERVICE_PATH" ]]; then
@@ -913,18 +1098,18 @@ show_status() {
     printf 'Fallback supervisor PID file: %s -> %s\n' "$PID_FILE" "$(cat "$PID_FILE" 2>/dev/null || true)"
   fi
 
-  pids="$(find_alpha_pids | tr '\n' ' ')"
+  pids="$(find_miner_pids | tr '\n' ' ')"
   if [[ -n "$pids" ]]; then
-    printf 'Matching alpha-miner PIDs: %s\n' "$pids"
+    printf 'Matching miner PIDs: %s\n' "$pids"
   else
-    printf 'Matching alpha-miner PIDs: none\n'
+    printf 'Matching miner PIDs: none\n'
   fi
 
   printf '\nRecent log lines:\n'
-  if [[ -r "${ALPHAPOOL_LOG:-$LOG_FILE}" ]]; then
-    tail -n 40 "${ALPHAPOOL_LOG:-$LOG_FILE}" || true
+  if [[ -r "${PEARL_MINER_LOG:-$LOG_FILE}" ]]; then
+    tail -n 40 "${PEARL_MINER_LOG:-$LOG_FILE}" || true
   else
-    printf 'Log file is not readable: %s\n' "${ALPHAPOOL_LOG:-$LOG_FILE}"
+    printf 'Log file is not readable: %s\n' "${PEARL_MINER_LOG:-$LOG_FILE}"
   fi
 }
 
@@ -933,12 +1118,13 @@ deploy() {
   ensure_root_access
   load_persisted_env
 
+  select_provider
   select_version
   select_address
   select_worker
   select_pool
 
-  download_and_install_miner "$ALPHAPOOL_VERSION"
+  download_and_install_miner "$PEARL_MINER_VERSION"
   write_runtime_scripts
   write_env_file
   stop_existing_miner
@@ -951,11 +1137,12 @@ deploy() {
   fi
 
   printf '\nDeployment summary:\n'
-  printf '  Version: %s\n' "$ALPHAPOOL_VERSION"
-  printf '  Binary:  %s\n' "$ALPHAPOOL_BIN"
-  printf '  Pool:    %s\n' "$ALPHAPOOL_POOL"
-  printf '  Worker:  %s\n' "$ALPHAPOOL_WORKER"
-  printf '  Log:     %s\n' "$ALPHAPOOL_LOG"
+  printf '  Provider: %s\n' "$PEARL_MINER_PROVIDER"
+  printf '  Version:  %s\n' "$PEARL_MINER_VERSION"
+  printf '  Binary:   %s\n' "$PEARL_MINER_BIN"
+  printf '  Pool:     %s\n' "$PEARL_MINER_POOL"
+  printf '  Worker:   %s\n' "$PEARL_MINER_WORKER"
+  printf '  Log:      %s\n' "$PEARL_MINER_LOG"
   if have_systemd; then
     printf '  Status:  systemctl status %s\n' "$SERVICE_NAME"
   else

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared AlphaPool network helpers. Source this file from deployment scripts.
+# Shared mining pool network helpers. Source this file from deployment scripts.
 
 ALPHAPOOL_ENDPOINTS=(
   "US East|us1.alphapool.tech|5566"
@@ -41,6 +41,21 @@ alphapool_list_pool_ports() {
       printf '%s\t%s\t%s\n' "$region" "$host" "$port"
     done
   done
+}
+
+pool_list_ports_from_entries() {
+  local item region host ports port
+
+  for item in "$@"; do
+    IFS='|' read -r region host ports <<< "$item"
+    for port in $ports; do
+      printf '%s\t%s\t%s\n' "$region" "$host" "$port"
+    done
+  done
+}
+
+pool_tcp_probe() {
+  alphapool_tcp_probe "$@"
 }
 
 alphapool_tcp_probe() {
@@ -176,6 +191,10 @@ alphapool_test_endpoint_tsv() {
     "$min_ms" "$avg_ms" "$max_ms" "$jitter_ms" "$status" "$score"
 }
 
+pool_test_endpoint_tsv() {
+  alphapool_test_endpoint_tsv "$@"
+}
+
 alphapool_best_result_from_tsv() {
   awk -F '\t' '
     $12 != "DOWN" {
@@ -189,4 +208,8 @@ alphapool_best_result_from_tsv() {
       if (found) print best
     }
   '
+}
+
+pool_best_result_from_tsv() {
+  alphapool_best_result_from_tsv
 }
